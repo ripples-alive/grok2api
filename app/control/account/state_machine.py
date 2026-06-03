@@ -27,7 +27,6 @@ class StatePolicy:
 
 _DEFAULT_POLICY = StatePolicy()
 
-
 # ---------------------------------------------------------------------------
 # Feedback
 # ---------------------------------------------------------------------------
@@ -66,7 +65,9 @@ class AccountFeedback:
             kind = FeedbackKind.UNAUTHORIZED
         elif status_code == 403:
             kind = FeedbackKind.FORBIDDEN
-        elif status_code == 429:
+        elif status_code == 429 or status_code == 402:
+            # 402 from console.x.ai = account credits exhausted; treat as a
+            # rate-limited token so the pool routes around it.
             kind = FeedbackKind.RATE_LIMITED
         elif status_code >= 500:
             kind = FeedbackKind.SERVER_ERROR

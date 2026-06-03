@@ -35,8 +35,25 @@ from app.dataplane.reverse.protocol.xai_chat import (
     classify_line,
     StreamAdapter,
 )
+from app.dataplane.reverse.protocol.xai_console import (
+    build_console_input,
+    build_console_payload,
+    classify_console_sse_line,
+    ConsoleStreamAdapter,
+    convert_openai_tool_choice,
+    convert_openai_tools_to_console,
+    extract_console_annotations,
+    extract_console_reasoning,
+    extract_console_search_sources,
+    extract_console_text,
+    extract_console_tool_calls,
+    extract_console_usage,
+    format_search_sources_suffix,
+    inject_web_search_tool,
+    parse_console_error,
+)
 from app.dataplane.reverse.protocol.xai_usage import is_invalid_credentials_error
-from app.dataplane.reverse.runtime.endpoint_table import CHAT
+from app.dataplane.reverse.runtime.endpoint_table import CHAT, CONSOLE_RESPONSES
 from app.dataplane.reverse.transport.asset_upload import upload_from_input
 from app.dataplane.reverse.protocol.tool_prompt import (
     build_tool_system_prompt,
@@ -135,10 +152,7 @@ async def _fail_sync(
         svc = get_refresh_service()
         if svc:
             await svc.record_failure_async(token, mode_id, exc)
-            if (
-                current_strategy() == "quota"
-                and getattr(exc, "status", None) == 429
-            ):
+            if current_strategy() == "quota" and getattr(exc, "status", None) == 429:
                 result = await svc.refresh_on_demand()
                 logger.info(
                     "account on-demand refresh triggered: token={}... mode_id={} refreshed={} failed={} rate_limited={}",
@@ -235,9 +249,8 @@ async def _resolve_image(token: str, url: str, image_id: str) -> str:
     cfg = get_config()
     fmt = _normalize_image_format(cfg.get_str("features.image_format", "grok_url"))
 
-    proxy_imagine_public = (
-        _is_imagine_public_url(url)
-        and cfg.get_bool("features.imagine_public_image_proxy", False)
+    proxy_imagine_public = _is_imagine_public_url(url) and cfg.get_bool(
+        "features.imagine_public_image_proxy", False
     )
 
     # Formats that don't need downloading
@@ -446,6 +459,539 @@ async def _stream_chat(
             ) from exc
 
 
+# ---------------------------------------------------------------------------
+# Console API (console.x.ai/v1/responses) dispatch
+# ---------------------------------------------------------------------------
+
+
+async def _console_post(
+    *,
+    token: str,
+    console_model: str,
+    input: Any,
+    instructions: str,
+    stream: bool,
+    temperature: float | None,
+    top_p: float | None,
+    tools: list[dict] | None,
+    tool_choice: Any,
+    timeout_s: float,
+    reasoning_effort: str | None = None,
+) -> Any:
+    """POST to console.x.ai/v1/responses; return ``(session, response)``.
+
+    For ``stream=True`` the response object's ``aiter_lines()`` must be
+    consumed by the caller. For ``stream=False`` the caller should read
+    ``response.content`` and parse it as JSON. The caller is responsible
+    for closing the returned ``session`` via ``await session.__aexit__()``.
+    """
+    proxy = await get_proxy_runtime()
+    lease = await proxy.acquire()
+
+    payload = build_console_payload(
+        console_model=console_model,
+        input=input,
+        instructions=instructions,
+        stream=stream,
+        temperature=temperature,
+        top_p=top_p,
+        reasoning_effort=reasoning_effort,
+        tools=tools,
+        tool_choice=tool_choice,
+    )
+    payload_bytes = orjson.dumps(payload)
+
+    headers = build_http_headers(
+        token,
+        content_type="application/json",
+        origin="https://console.x.ai",
+        referer="https://console.x.ai/",
+        lease=lease,
+    )
+    session_kwargs = build_session_kwargs(lease=lease)
+
+    session = ResettableSession(**session_kwargs)
+    await session.__aenter__()
+    try:
+        response = await session.post(
+            CONSOLE_RESPONSES,
+            headers=headers,
+            data=payload_bytes,
+            timeout=timeout_s,
+            stream=stream,
+        )
+    except Exception as exc:
+        await session.__aexit__(None, None, None)
+        raise _transport_upstream_error(
+            exc, context="Console transport failed"
+        ) from exc
+
+    if response.status_code != 200:
+        try:
+            body = response.content.decode("utf-8", "replace")[:400]
+        except Exception:
+            body = ""
+        await session.__aexit__(None, None, None)
+        raise parse_console_error(response.status_code, body)
+
+    return session, response
+
+
+def _console_input_to_text(input_array: list[dict]) -> str:
+    """Flatten a console input array into plain text for token estimation."""
+    parts: list[str] = []
+    for item in input_array:
+        if not isinstance(item, dict):
+            continue
+        content = item.get("content")
+        if isinstance(content, str):
+            parts.append(content)
+        elif isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") in ("input_text", "output_text", "text"):
+                    text = block.get("text") or ""
+                    if text:
+                        parts.append(text)
+    return "\n".join(parts)
+
+
+async def _console_completions(
+    *,
+    spec,
+    model: str,
+    messages: list[dict],
+    is_stream: bool,
+    emit_think: bool,
+    temperature: float = 0.8,
+    top_p: float = 0.95,
+    reasoning_effort: str | None = None,
+    tools: list[dict] | None = None,
+    tool_choice: Any = None,
+) -> dict | AsyncGenerator[str, None]:
+    """Dispatch a chat completion through console.x.ai/v1/responses.
+
+    Used for models with ``spec.console_model`` set. SSO cookies from the
+    grok.com account pool authenticate console.x.ai requests, allowing
+    basic-tier (free) accounts to access all available models.
+
+    Supports:
+      - Multimodal input (text + images) via OpenAI Responses-style content blocks
+      - Native function calling via the ``tools`` parameter
+      - SSE streaming for both text and tool call arguments
+      - URL citation annotations from upstream search results
+    """
+    # Apply per-model default effort only where accepted. Some console
+    # models, including grok-4.20, reject an implicit reasoning field.
+    if reasoning_effort is None and spec.default_reasoning_effort:
+        reasoning_effort = spec.default_reasoning_effort
+    cfg = get_config()
+    console_model = spec.console_model
+
+    # Convert OpenAI messages → console structured input + instructions.
+    # System messages are folded into ``instructions`` for cleaner reasoning
+    # behaviour; text/image blocks become input_text/input_image; assistant
+    # tool_calls become function_call items; tool results become
+    # function_call_output items.
+    input_array, instructions = build_console_input(messages)
+    if not input_array and not instructions:
+        raise UpstreamError("Empty messages after conversion", status=400)
+
+    # Convert OpenAI tools → console tools (flat name/description/parameters).
+    console_tools = convert_openai_tools_to_console(tools) if tools else None
+    console_tool_choice = (
+        convert_openai_tool_choice(tool_choice)
+        if console_tools and tool_choice is not None
+        else None
+    )
+
+    # Always enable web search for console models — this is the primary
+    # reason for selecting the console route. Costs $5/1000 calls from
+    # the account's prepaid (trial) credits. Idempotent: existing
+    # ``web_search`` tool in the request is preserved.
+    console_tools = inject_web_search_tool(console_tools)
+
+    from app.dataplane.account import _directory as _acct_dir
+
+    if _acct_dir is None:
+        raise RateLimitError("Account directory not initialised")
+    directory = _acct_dir
+
+    max_retries = selection_max_retries()
+    retry_codes = _configured_retry_codes(cfg)
+    response_id = make_response_id()
+    timeout_s = cfg.get_float("chat.timeout", 120.0)
+    prompt_text = _console_input_to_text(input_array)
+
+    # ── Streaming path ────────────────────────────────────────────────────────
+    if is_stream:
+
+        async def _run_stream() -> AsyncGenerator[str, None]:
+            excluded: list[str] = []
+            for attempt in range(max_retries + 1):
+                acct, selected_mode_id = await reserve_account(
+                    directory,
+                    spec,
+                    now_s_override=now_s(),
+                    exclude_tokens=excluded or None,
+                )
+                if acct is None:
+                    raise RateLimitError("No available accounts for this model tier")
+
+                token = acct.token
+                success = False
+                _retry = False
+                fail_exc: BaseException | None = None
+                adapter = ConsoleStreamAdapter()
+                tool_calls_emitted = False
+
+                try:
+                    try:
+                        session, response = await _console_post(
+                            token=token,
+                            console_model=console_model,
+                            input=input_array,
+                            instructions=instructions,
+                            stream=True,
+                            temperature=temperature,
+                            top_p=top_p,
+                            reasoning_effort=reasoning_effort,
+                            tools=console_tools,
+                            tool_choice=console_tool_choice,
+                            timeout_s=timeout_s,
+                        )
+                        try:
+                            async for raw_line in response.aiter_lines():
+                                kind, payload = classify_console_sse_line(raw_line)
+                                if kind == "event":
+                                    adapter.feed_event(payload)
+                                    continue
+                                if kind != "data" or not payload:
+                                    continue
+                                ev = adapter.feed_data(payload)
+                                ev_kind = ev.get("kind")
+                                if ev_kind == "text":
+                                    chunk = make_stream_chunk(
+                                        response_id, model, ev["content"]
+                                    )
+                                    yield f"data: {orjson.dumps(chunk).decode()}\n\n"
+                                elif ev_kind == "thinking" and emit_think:
+                                    chunk = make_thinking_chunk(
+                                        response_id, model, ev["content"]
+                                    )
+                                    yield f"data: {orjson.dumps(chunk).decode()}\n\n"
+                                elif ev_kind == "tool_call_start":
+                                    # First chunk for this tool call: id + name + empty args
+                                    tool_calls_emitted = True
+                                    chunk = make_tool_call_chunk(
+                                        response_id,
+                                        model,
+                                        ev["index"],
+                                        ev["call_id"],
+                                        ev["name"],
+                                        "",
+                                        is_first=True,
+                                    )
+                                    yield f"data: {orjson.dumps(chunk).decode()}\n\n"
+                                elif ev_kind == "tool_call_args":
+                                    # Subsequent chunks: incremental args delta
+                                    chunk = make_tool_call_chunk(
+                                        response_id,
+                                        model,
+                                        ev["index"],
+                                        "",
+                                        "",
+                                        ev["delta"],
+                                        is_first=False,
+                                    )
+                                    yield f"data: {orjson.dumps(chunk).decode()}\n\n"
+                                elif ev_kind == "tool_call_done":
+                                    # No-op; final done chunk is emitted after
+                                    # all events have completed.
+                                    pass
+                                elif ev_kind == "error":
+                                    raise UpstreamError(
+                                        ev.get("message", "Console stream error"),
+                                        status=502,
+                                    )
+                                elif ev_kind == "done":
+                                    break
+                        finally:
+                            await session.__aexit__(None, None, None)
+
+                        # Stream completed — emit appropriate final chunk
+                        if tool_calls_emitted:
+                            done_chunk = make_tool_call_done_chunk(response_id, model)
+                            if adapter.search_sources:
+                                done_chunk["search_sources"] = list(
+                                    adapter.search_sources
+                                )
+                            yield f"data: {orjson.dumps(done_chunk).decode()}\n\n"
+                        else:
+                            chat_anns = (
+                                _to_chat_annotations(adapter.annotations)
+                                if adapter.annotations
+                                else None
+                            )
+                            # Append ## Sources markdown block when
+                            # features.show_search_sources is enabled (mirrors
+                            # the grok.com path). Emitted as a separate text
+                            # chunk before the final empty chunk so clients
+                            # streaming raw deltas see the suffix in order.
+                            references = adapter.references_suffix()
+                            if references:
+                                ref_chunk = make_stream_chunk(
+                                    response_id, model, references
+                                )
+                                yield f"data: {orjson.dumps(ref_chunk).decode()}\n\n"
+                            final = make_stream_chunk(
+                                response_id,
+                                model,
+                                "",
+                                is_final=True,
+                                annotations=chat_anns,
+                            )
+                            # Inject search_sources at root level (parallel
+                            # to grok.com path behaviour). Avoids putting
+                            # them inside delta which would violate strict
+                            # OpenAI schemas.
+                            if adapter.search_sources:
+                                final["search_sources"] = list(adapter.search_sources)
+                            yield f"data: {orjson.dumps(final).decode()}\n\n"
+                        yield "data: [DONE]\n\n"
+                        success = True
+                        logger.info(
+                            "console stream completed: attempt={}/{} model={} text_len={} tool_calls={} sources={}",
+                            attempt + 1,
+                            max_retries + 1,
+                            model,
+                            sum(len(s) for s in adapter.text_buf),
+                            len(adapter.tool_calls),
+                            len(adapter.search_sources),
+                        )
+
+                    except UpstreamError as exc:
+                        fail_exc = exc
+                        if (
+                            _should_retry_upstream(exc, retry_codes)
+                            and attempt < max_retries
+                        ):
+                            _retry = True
+                            logger.warning(
+                                "console stream retry: attempt={}/{} status={} token={}...",
+                                attempt + 1,
+                                max_retries,
+                                exc.status,
+                                token[:8],
+                            )
+                        else:
+                            logger.warning(
+                                "console stream failed: attempt={}/{} model={} status={} body={}",
+                                attempt + 1,
+                                max_retries + 1,
+                                model,
+                                exc.status,
+                                _upstream_body_excerpt(exc),
+                            )
+                            raise
+
+                finally:
+                    await directory.release(acct)
+                    kind = (
+                        FeedbackKind.SUCCESS
+                        if success
+                        else _feedback_kind(fail_exc)
+                        if fail_exc
+                        else FeedbackKind.SERVER_ERROR
+                    )
+                    await directory.feedback(
+                        token, kind, selected_mode_id, now_s_val=now_s()
+                    )
+                    if success:
+                        asyncio.create_task(
+                            _quota_sync(token, selected_mode_id)
+                        ).add_done_callback(_log_task_exception)
+                    else:
+                        asyncio.create_task(
+                            _fail_sync(token, selected_mode_id, fail_exc)
+                        ).add_done_callback(_log_task_exception)
+
+                if success or not _retry:
+                    return
+                excluded.append(token)
+
+        return _run_stream()
+
+    # ── Non-streaming path ────────────────────────────────────────────────────
+    excluded: list[str] = []
+    full_text = ""
+    full_thinking = ""
+    response_tool_calls: list[dict] = []
+    response_annotations: list[dict] = []
+    response_search_sources: list[dict] = []
+    usage: dict[str, int] = {}
+    for attempt in range(max_retries + 1):
+        acct, selected_mode_id = await reserve_account(
+            directory,
+            spec,
+            now_s_override=now_s(),
+            exclude_tokens=excluded or None,
+        )
+        if acct is None:
+            raise RateLimitError("No available accounts for this model tier")
+
+        token = acct.token
+        success = False
+        _retry = False
+        fail_exc: BaseException | None = None
+
+        try:
+            try:
+                session, response = await _console_post(
+                    token=token,
+                    console_model=console_model,
+                    input=input_array,
+                    instructions=instructions,
+                    stream=False,
+                    temperature=temperature,
+                    top_p=top_p,
+                    reasoning_effort=reasoning_effort,
+                    tools=console_tools,
+                    tool_choice=console_tool_choice,
+                    timeout_s=timeout_s,
+                )
+                try:
+                    body_bytes = response.content
+                    if hasattr(body_bytes, "__await__"):
+                        body_bytes = await body_bytes  # type: ignore[misc]
+                finally:
+                    await session.__aexit__(None, None, None)
+
+                try:
+                    response_json = orjson.loads(body_bytes)
+                except (orjson.JSONDecodeError, ValueError, TypeError) as exc:
+                    raise UpstreamError(
+                        f"Console returned non-JSON body: {exc}",
+                        status=502,
+                        body=str(body_bytes)[:400],
+                    ) from exc
+
+                full_text = extract_console_text(response_json)
+                full_thinking = (
+                    extract_console_reasoning(response_json) if emit_think else ""
+                )
+                response_tool_calls = extract_console_tool_calls(response_json)
+                response_annotations = extract_console_annotations(response_json)
+                response_search_sources = extract_console_search_sources(response_json)
+                usage = extract_console_usage(response_json)
+                success = True
+
+            except UpstreamError as exc:
+                fail_exc = exc
+                if _should_retry_upstream(exc, retry_codes) and attempt < max_retries:
+                    _retry = True
+                    logger.warning(
+                        "console retry: attempt={}/{} status={} token={}...",
+                        attempt + 1,
+                        max_retries,
+                        exc.status,
+                        token[:8],
+                    )
+                else:
+                    logger.warning(
+                        "console request failed: attempt={}/{} model={} status={} body={}",
+                        attempt + 1,
+                        max_retries + 1,
+                        model,
+                        exc.status,
+                        _upstream_body_excerpt(exc),
+                    )
+                    raise
+
+        finally:
+            await directory.release(acct)
+            kind = (
+                FeedbackKind.SUCCESS
+                if success
+                else _feedback_kind(fail_exc)
+                if fail_exc
+                else FeedbackKind.SERVER_ERROR
+            )
+            await directory.feedback(token, kind, selected_mode_id, now_s_val=now_s())
+            if success:
+                asyncio.create_task(
+                    _quota_sync(token, selected_mode_id)
+                ).add_done_callback(_log_task_exception)
+            else:
+                asyncio.create_task(
+                    _fail_sync(token, selected_mode_id, fail_exc)
+                ).add_done_callback(_log_task_exception)
+
+        if success or not _retry:
+            break
+        excluded.append(token)
+
+    logger.info(
+        "console request completed: model={} text_len={} reasoning_len={} tool_calls={} sources={} usage={}",
+        model,
+        len(full_text),
+        len(full_thinking),
+        len(response_tool_calls),
+        len(response_search_sources),
+        usage,
+    )
+
+    # Use upstream usage when available; fall back to estimation otherwise.
+    pt = usage.get("prompt_tokens") or estimate_prompt_tokens(prompt_text)
+    ct = usage.get("completion_tokens") or estimate_tokens(full_text)
+    rt = usage.get("reasoning_tokens") or (
+        estimate_tokens(full_thinking) if full_thinking else 0
+    )
+
+    # If upstream returned tool calls, return the tool_calls response variant.
+    if response_tool_calls:
+        from app.dataplane.reverse.protocol.tool_parser import ParsedToolCall
+
+        parsed_calls = [
+            ParsedToolCall(
+                call_id=tc["id"],
+                name=tc["function"]["name"],
+                arguments=tc["function"]["arguments"],
+            )
+            for tc in response_tool_calls
+        ]
+        resp = make_tool_call_response(
+            model,
+            parsed_calls,
+            prompt_content=prompt_text,
+            response_id=response_id,
+            usage=build_usage(pt, ct + rt, reasoning_tokens=rt),
+        )
+        if response_search_sources:
+            resp["search_sources"] = response_search_sources
+        return resp
+
+    chat_anns = (
+        _to_chat_annotations(response_annotations) if response_annotations else None
+    )
+    # Append ## Sources markdown block to the body when
+    # features.show_search_sources is enabled (mirrors grok.com path).
+    references = format_search_sources_suffix(response_search_sources)
+    if references:
+        full_text = (full_text or "") + references
+    return make_chat_response(
+        model,
+        full_text,
+        prompt_content=prompt_text,
+        response_id=response_id,
+        reasoning_content=full_thinking or None,
+        search_sources=response_search_sources or None,
+        annotations=chat_anns,
+        usage=build_usage(pt, ct + rt, reasoning_tokens=rt),
+    )
+
+
 async def completions(
     *,
     model: str,
@@ -456,6 +1002,7 @@ async def completions(
     tool_choice: Any = None,
     temperature: float = 0.8,
     top_p: float = 0.95,
+    reasoning_effort: str | None = None,
     request_overrides: dict | None = None,
 ) -> dict | AsyncGenerator[str, None]:
     """Entry point for /v1/chat/completions.
@@ -476,6 +1023,25 @@ async def completions(
         is_stream,
         len(messages),
     )
+
+    # ── Console API dispatch ──────────────────────────────────────────────────
+    # Models with `console_model` set route through console.x.ai/v1/responses
+    # using the same SSO cookies as grok.com, but support all models for
+    # basic-tier (free) accounts. Supports multimodal input and native
+    # function calling.
+    if spec.is_console():
+        return await _console_completions(
+            spec=spec,
+            model=model,
+            messages=messages,
+            is_stream=is_stream,
+            emit_think=emit_think,
+            temperature=temperature,
+            top_p=top_p,
+            reasoning_effort=reasoning_effort,
+            tools=tools,
+            tool_choice=tool_choice,
+        )
 
     message, files = _extract_message(messages)
     if not message.strip():

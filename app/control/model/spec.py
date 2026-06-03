@@ -20,6 +20,19 @@ class ModelSpec:
     ``public_name`` is the human-readable display name.
     ``prefer_best`` when True, reverses pool priority to try higher-tier
                     pools first (hard priority, not soft preference).
+    ``console_model`` when non-empty, route this model through the
+                    ``console.x.ai/v1/responses`` endpoint instead of the
+                    ``grok.com`` web chat API. The string is the actual
+                    model ID sent to console.x.ai (e.g. ``"grok-4.3"``).
+                    SSO cookies from grok.com work for both endpoints,
+                    so basic-tier accounts can access all models this way.
+    ``default_reasoning_effort`` when non-empty, this value is forwarded as
+                    ``reasoning.effort`` to the console upstream when the
+                    caller doesn't specify ``reasoning_effort`` themselves.
+                    Set only on models that accept this field; for example,
+                    grok-4.20 rejects implicit effort and must leave it empty.
+                    Only consulted when ``console_model`` is set; ignored
+                    on the legacy grok.com path.
     """
 
     model_name: str
@@ -29,6 +42,8 @@ class ModelSpec:
     enabled: bool
     public_name: str
     prefer_best: bool = False
+    console_model: str = ""
+    default_reasoning_effort: str = ""
 
     # --- convenience predicates ---
 
@@ -46,6 +61,10 @@ class ModelSpec:
 
     def is_voice(self) -> bool:
         return bool(self.capability & Capability.VOICE)
+
+    def is_console(self) -> bool:
+        """Return True if this model routes through console.x.ai."""
+        return bool(self.console_model)
 
     def pool_name(self) -> str:
         """Return the canonical pool string for this tier."""
